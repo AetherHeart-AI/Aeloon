@@ -9,6 +9,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from aeloon.core.config.paths import get_storage_gateway
+
 
 @dataclass
 class WorkflowExecutionState:
@@ -52,7 +54,7 @@ class WorkflowStateStore:
 
     def __init__(self, workspace: Path) -> None:
         self.workspace = workspace
-        self.root = self.workspace / ".aeloon" / "workflows"
+        self.root = get_storage_gateway(workspace).project_workflows_root()
         self.root.mkdir(parents=True, exist_ok=True)
 
     def create(

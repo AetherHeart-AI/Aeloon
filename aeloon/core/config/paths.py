@@ -125,6 +125,40 @@ def get_cli_history_path() -> Path:
     return get_aeloon_home() / "history" / "cli_history"
 
 
+class ProjectStorageGateway:
+    """Workspace-scoped storage roots for project-local generated artifacts."""
+
+    def __init__(self, workspace: str | Path) -> None:
+        self.workspace = Path(workspace).expanduser().resolve()
+        self.root = self.workspace / ".aeloon"
+
+    def project_root(self, *, create: bool = True) -> Path:
+        return ensure_dir(self.root) if create else self.root
+
+    def project_cache_root(self, name: str | None = None, *, create: bool = True) -> Path:
+        root = self.project_root(create=create) / "cache"
+        if name:
+            root = root / name
+        return ensure_dir(root) if create else root
+
+    def project_compiled_skills_root(self, *, create: bool = True) -> Path:
+        root = self.project_cache_root(create=create) / "compiled_skills"
+        return ensure_dir(root) if create else root
+
+    def project_skills_root(self, *, create: bool = True) -> Path:
+        root = self.project_root(create=create) / "skills"
+        return ensure_dir(root) if create else root
+
+    def project_workflows_root(self, *, create: bool = True) -> Path:
+        root = self.project_root(create=create) / "workflows"
+        return ensure_dir(root) if create else root
+
+
+def get_storage_gateway(workspace: str | Path) -> ProjectStorageGateway:
+    """Return the storage gateway for a project workspace."""
+    return ProjectStorageGateway(workspace)
+
+
 def get_bridge_install_dir() -> Path:
     """Return the WhatsApp bridge directory."""
     return get_aeloon_home() / "bridge"
