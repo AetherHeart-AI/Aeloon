@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import re
 import shlex
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -123,6 +123,12 @@ class DispatcherCapability:
     code_example: str
     source_refs: list[dict[str, Any]]
     keywords: list[str]
+    script_path: str = ""
+    input_bindings: dict[str, str] | None = None
+    can_produce_final_answer: bool = False
+    confidence: float = 1.0
+    validation_status: str = "static"
+    provenance: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -135,6 +141,12 @@ class DispatcherCapability:
             "code_example": self.code_example,
             "source_refs": list(self.source_refs),
             "keywords": list(self.keywords),
+            "script_path": self.script_path,
+            "input_bindings": dict(self.input_bindings or {}),
+            "can_produce_final_answer": self.can_produce_final_answer,
+            "confidence": self.confidence,
+            "validation_status": self.validation_status,
+            "provenance": dict(self.provenance or {}),
         }
 
 
@@ -181,6 +193,7 @@ def extract_dispatcher_capabilities(
     package: SkillPackage, entry_skill: Path
 ) -> list[DispatcherCapability]:
     content = entry_skill.read_text(encoding="utf-8") if entry_skill.exists() else ""
+    generic_capabilities = _generic_office_capabilities(package, entry_skill)
     blocks = list(_iter_blocks(content))
     local_modules = {
         Path(asset.path).stem
@@ -260,10 +273,372 @@ def extract_dispatcher_capabilities(
                     code_example=asset.path,
                     source_refs=[{"path": asset.path, "line": None, "snippet": asset.path}],
                     keywords=_build_keywords(asset.path),
+                    script_path=asset.path,
                 )
             )
 
-    return capabilities
+    if generic_capabilities and package.slug in {"docx", "pptx"}:
+        capabilities = [cap for cap in capabilities if cap.kind != "shell_command"]
+    return _dedupe_capabilities(generic_capabilities + capabilities)
+
+
+def _apply_refined_dispatcher_payload(
+    capabilities: list[DispatcherCapability],
+    data: dict[str, Any],
+) -> tuple[list[DispatcherCapability], list[str], bool]:
+    if not isinstance(data, dict):
+        return capabilities, ["refinement_payload_not_object"], False
+    items = data.get("operators")
+    if not isinstance(items, list):
+        return capabilities, ["refinement_missing_operators"], False
+
+    by_source = {
+        str(item.get("source_name") or ""): item for item in items if isinstance(item, dict)
+    }
+    issues: list[str] = []
+    refined: list[DispatcherCapability] = []
+    changed = False
+    for cap in capabilities:
+        item = by_source.get(cap.name)
+        if item is None:
+            refined.append(cap)
+            continue
+        if item.get("include") is False:
+            issues.append(f"dropped_operator:{cap.name}")
+            changed = True
+            continue
+        new_inputs = _refined_inputs(cap, item.get("inputs"), issues)
+        keywords = _list_strings(item.get("keywords"), limit=120) or list(cap.keywords)
+        refined_cap = replace(
+            cap,
+            name=_capability_name(str(item.get("name") or cap.name)),
+            title=_bounded_text(item.get("title"), cap.title, limit=120),
+            summary=_bounded_text(item.get("summary"), cap.summary, limit=700),
+            inputs=new_inputs,
+            keywords=keywords,
+            confidence=_confidence(item.get("confidence"), default=cap.confidence),
+            validation_status="llm_refined_validated",
+            provenance={"refinement": "llm_refined", "source_name": cap.name},
+        )
+        changed = changed or refined_cap.to_dict() != cap.to_dict()
+        refined.append(refined_cap)
+
+    known = {cap.name for cap in capabilities}
+    for source_name in sorted(set(by_source) - known):
+        issues.append(f"ignored_unknown_operator:{source_name}")
+    if not refined:
+        return capabilities, issues + ["refinement_dropped_all_operators"], False
+    return _dedupe_capabilities(refined), issues, changed
+
+
+def _refined_inputs(
+    cap: DispatcherCapability,
+    raw_inputs: Any,
+    issues: list[str],
+) -> list[IOField]:
+    if not isinstance(raw_inputs, list):
+        return [IOField(**field.model_dump()) for field in cap.inputs]
+    existing_by_name = {field.name: field for field in cap.inputs}
+    existing_by_normalized = {_capability_name(field.name): field for field in cap.inputs}
+    if not existing_by_name:
+        if raw_inputs:
+            issues.append(f"ignored_new_inputs_for_schema_free_operator:{cap.name}")
+        return []
+    refined: list[IOField] = []
+    seen: set[str] = set()
+    for item in raw_inputs:
+        if isinstance(item, str):
+            raw_name = item
+            description = ""
+        elif isinstance(item, dict):
+            raw_name = str(item.get("name") or "")
+            description = str(item.get("description") or "")
+        else:
+            continue
+        source = existing_by_name.get(raw_name) or existing_by_normalized.get(
+            _capability_name(raw_name)
+        )
+        if source is None:
+            issues.append(f"ignored_unknown_input:{cap.name}.{raw_name}")
+            continue
+        if source.name in seen:
+            continue
+        field_data = source.model_dump()
+        if description:
+            field_data["description"] = description[:240].rstrip()
+        refined.append(IOField(**field_data))
+        seen.add(source.name)
+    return refined or [IOField(**field.model_dump()) for field in cap.inputs]
+
+
+def _bounded_text(value: Any, fallback: str, *, limit: int) -> str:
+    text = str(value or "").strip()
+    return text[:limit].rstrip() if text else fallback
+
+
+def _list_strings(value: Any, *, limit: int) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    out: list[str] = []
+    for item in value:
+        text = str(item or "").strip()
+        if text and text not in out:
+            out.append(text[:80].rstrip())
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _confidence(value: Any, *, default: float) -> float:
+    try:
+        return min(1.0, max(0.0, float(value)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _field(
+    name: str,
+    *,
+    field_type: str = "string",
+    required: bool = True,
+    description: str = "",
+) -> IOField:
+    return IOField(name=name, type=field_type, required=required, description=description)
+
+
+def _generic_office_capabilities(
+    package: SkillPackage,
+    entry_skill: Path,
+) -> list[DispatcherCapability]:
+    if package.slug == "docx":
+        return _generic_docx_capabilities(entry_skill)
+    if package.slug == "pptx":
+        return _generic_pptx_capabilities(entry_skill)
+    return []
+
+
+def _generic_source_ref(entry_skill: Path, snippet: str) -> list[dict[str, Any]]:
+    return [{"path": entry_skill.name or "SKILL.md", "line": None, "snippet": snippet}]
+
+
+def _generic_docx_capabilities(entry_skill: Path) -> list[DispatcherCapability]:
+    source_refs = _generic_source_ref(
+        entry_skill,
+        "Generic DOCX executable operators derived only from the docx skill package.",
+    )
+    return [
+        DispatcherCapability(
+            name="inspect_docx",
+            title="Inspect DOCX structure",
+            kind="docx_inspect",
+            summary=(
+                "Generic executable operator that summarizes DOCX paragraphs, tables, "
+                "headers, footers, and placeholder-like text."
+            ),
+            inputs=[_field("path", description="Input DOCX workspace path.")],
+            commands=[],
+            code_example="inspect_docx(path)",
+            source_refs=source_refs,
+            keywords=_build_keywords("docx inspect structure paragraphs tables headers footers placeholders"),
+        ),
+        DispatcherCapability(
+            name="replace_docx_text",
+            title="Replace DOCX text",
+            kind="docx_replace_text",
+            summary=(
+                "Generic executable operator for split-run-safe text replacement across "
+                "DOCX body, tables, headers, and footers."
+            ),
+            inputs=[
+                _field("input_path", description="Input DOCX workspace path."),
+                _field("output_path", description="Output DOCX workspace path."),
+                _field(
+                    "replacements",
+                    field_type="object",
+                    description="Mapping of exact text/placeholders to replacement text.",
+                ),
+                _field(
+                    "include_headers_footers",
+                    field_type="boolean",
+                    required=False,
+                    description="Whether to process headers and footers. Defaults to true.",
+                ),
+                _field(
+                    "include_tables",
+                    field_type="boolean",
+                    required=False,
+                    description="Whether to process table cells. Defaults to true.",
+                ),
+            ],
+            commands=[],
+            code_example="replace_docx_text(input_path, output_path, replacements)",
+            source_refs=source_refs,
+            keywords=_build_keywords("docx replace placeholders split runs headers footers tables template"),
+        ),
+        DispatcherCapability(
+            name="remove_or_keep_marked_blocks",
+            title="Remove or keep marked DOCX blocks",
+            kind="docx_marked_blocks",
+            summary=(
+                "Generic executable operator that removes or keeps text blocks delimited "
+                "by caller-provided markers."
+            ),
+            inputs=[
+                _field("input_path", description="Input DOCX workspace path."),
+                _field("output_path", description="Output DOCX workspace path."),
+                _field(
+                    "markers",
+                    field_type="array",
+                    description="Marker specs with name/start/end and optional keep flag.",
+                ),
+                _field(
+                    "conditions",
+                    field_type="object",
+                    required=False,
+                    description="Optional mapping from marker name to keep/remove boolean.",
+                ),
+            ],
+            commands=[],
+            code_example="remove_or_keep_marked_blocks(input_path, output_path, markers)",
+            source_refs=source_refs,
+            keywords=_build_keywords("docx conditional section marker remove keep block template"),
+        ),
+        DispatcherCapability(
+            name="validate_docx_text",
+            title="Validate DOCX text",
+            kind="docx_validate_text",
+            summary="Generic executable operator that checks required and forbidden text in a DOCX.",
+            inputs=[
+                _field("path", description="Input DOCX workspace path."),
+                _field(
+                    "must_contain",
+                    field_type="array",
+                    required=False,
+                    description="Strings that must appear in the DOCX text.",
+                ),
+                _field(
+                    "must_not_contain",
+                    field_type="array",
+                    required=False,
+                    description="Strings that must not appear in the DOCX text.",
+                ),
+            ],
+            commands=[],
+            code_example="validate_docx_text(path, must_contain, must_not_contain)",
+            source_refs=source_refs,
+            keywords=_build_keywords("docx validate text placeholders markers required forbidden"),
+        ),
+    ]
+
+
+def _generic_pptx_capabilities(entry_skill: Path) -> list[DispatcherCapability]:
+    source_refs = _generic_source_ref(
+        entry_skill,
+        "Generic PPTX executable operators derived only from the pptx skill package.",
+    )
+    return [
+        DispatcherCapability(
+            name="inventory_pptx",
+            title="Inventory PPTX",
+            kind="pptx_inventory",
+            summary=(
+                "Generic executable operator that inventories slides, text boxes, shape ids, "
+                "text, and positions from a PPTX."
+            ),
+            inputs=[
+                _field("input_pptx", description="Input PPTX workspace path."),
+                _field("output_json", required=False, description="Optional output JSON report path."),
+                _field(
+                    "include_positions",
+                    field_type="boolean",
+                    required=False,
+                    description="Whether to include shape positions. Defaults to true.",
+                ),
+            ],
+            commands=[],
+            code_example="inventory_pptx(input_pptx, output_json)",
+            source_refs=source_refs,
+            keywords=_build_keywords("pptx inventory slides shapes text boxes positions ids"),
+        ),
+        DispatcherCapability(
+            name="update_pptx_text_boxes",
+            title="Update PPTX text boxes",
+            kind="pptx_update_text_boxes",
+            summary=(
+                "Generic executable operator that updates PPTX text boxes selected by "
+                "slide index, shape id, shape name, exact text, or substring."
+            ),
+            inputs=[
+                _field(
+                    "input_pptx",
+                    description="Input PPTX workspace path. Aliases: input_path, pptx_path, path.",
+                ),
+                _field("output_pptx", description="Output PPTX workspace path. Alias: output_path."),
+                _field(
+                    "edits",
+                    field_type="array",
+                    description=(
+                        "Text-box edit specs with selectors and replacement/style fields. "
+                        "Aliases: updates, text_boxes, or targets plus shared style fields."
+                    ),
+                ),
+            ],
+            commands=[],
+            code_example="update_pptx_text_boxes(input_pptx, output_pptx, edits=[...])",
+            source_refs=source_refs,
+            keywords=_build_keywords("pptx update text boxes shapes font position edit"),
+        ),
+        DispatcherCapability(
+            name="add_pptx_reference_slide",
+            title="Add PPTX reference slide",
+            kind="pptx_add_reference_slide",
+            summary=(
+                "Generic executable operator that appends a slide containing a title and "
+                "numbered or bulleted items supplied at runtime."
+            ),
+            inputs=[
+                _field(
+                    "input_pptx",
+                    description="Input PPTX workspace path. Aliases: input_path, pptx_path, path.",
+                ),
+                _field("output_pptx", description="Output PPTX workspace path. Alias: output_path."),
+                _field("title", required=False, description="Reference slide title."),
+                _field("items", field_type="array", description="Slide list items. Aliases: references, titles."),
+                _field(
+                    "numbered",
+                    field_type="boolean",
+                    required=False,
+                    description="Whether to use real auto-numbering bullets. Defaults to true.",
+                ),
+            ],
+            commands=[],
+            code_example="add_pptx_reference_slide(input_pptx, output_pptx, title='Reference', items=titles)",
+            source_refs=source_refs,
+            keywords=_build_keywords("pptx add reference slide numbered list items"),
+        ),
+        DispatcherCapability(
+            name="validate_pptx_file",
+            title="Validate PPTX file",
+            kind="pptx_validate_file",
+            summary="Generic executable operator that checks PPTX zip and python-pptx loadability.",
+            inputs=[_field("path", description="Input PPTX workspace path.")],
+            commands=[],
+            code_example="validate_pptx_file(path)",
+            source_refs=source_refs,
+            keywords=_build_keywords("pptx validate zip integrity presentation load"),
+        ),
+    ]
+
+
+def _dedupe_capabilities(capabilities: list[DispatcherCapability]) -> list[DispatcherCapability]:
+    counts: dict[str, int] = {}
+    deduped: list[DispatcherCapability] = []
+    for cap in capabilities:
+        counts[cap.name] = counts.get(cap.name, 0) + 1
+        if counts[cap.name] > 1:
+            cap.name = f"{cap.name}_{counts[cap.name]}"
+        deduped.append(cap)
+    return deduped
 
 
 def build_dispatcher_manifest(

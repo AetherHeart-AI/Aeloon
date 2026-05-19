@@ -6,6 +6,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from aeloon.core.agent.tools.registry import ToolRegistry
+from aeloon.core.config.paths import get_storage_gateway
 from aeloon.plugins._sdk.api import PluginAPI
 from aeloon.plugins._sdk.registry import PluginRegistry
 from aeloon.plugins._sdk.runtime import PluginRuntime
@@ -117,15 +118,18 @@ async def test_skill_compiler_command_compiles_and_refreshes(tmp_path, monkeypat
     plugin.register(api)
     await plugin.activate(api)
 
+    storage = get_storage_gateway(tmp_path)
+    compiled_dir = storage.project_compiled_skills_root(create=False)
+    skillgraph_cache = storage.project_cache_root("skillgraph", create=False)
     fake_result = SkillCompilerResult(
-        skill_path=tmp_path / "skills" / "demo",
+        skill_path=storage.project_skills_root(create=False) / "demo",
         package_slug="demo",
         workflow_name="demo",
-        output_path=tmp_path / "compiled_skills" / "demo_workflow.py",
-        manifest_path=tmp_path / "compiled_skills" / "demo_workflow.manifest.json",
-        sandbox_path=tmp_path / "compiled_skills" / "demo_workflow.sandbox",
-        report_path=tmp_path / ".aeloon" / "skillgraph" / "demo.report.json",
-        config_path=tmp_path / "compiled_skills" / "skill_config.json",
+        output_path=compiled_dir / "demo_workflow.py",
+        manifest_path=compiled_dir / "demo_workflow.manifest.json",
+        sandbox_path=compiled_dir / "demo_workflow.sandbox",
+        report_path=skillgraph_cache / "demo.report.json",
+        config_path=compiled_dir / "skill_config.json",
         model="test-model",
         runtime_model="override-model",
         base_url="https://example.com",

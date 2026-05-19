@@ -12,6 +12,8 @@ from typing import Any
 
 from loguru import logger
 
+from aeloon.core.config.paths import get_storage_gateway
+
 
 @dataclass
 class WorkflowMetadata:
@@ -32,20 +34,30 @@ class LoadedWorkflow:
 
 
 class WorkflowLoader:
-    """Discover compiled workflows under `<workspace>/compiled_skills`."""
+    """Discover compiled workflows under the project compiled-skill cache."""
 
     def __init__(self, workspace: Path, directory_name: str = "compiled_skills") -> None:
         self.workspace = workspace
-        self.directory = workspace / directory_name
+        if directory_name == "compiled_skills":
+            self.directory = get_storage_gateway(workspace).project_compiled_skills_root(
+                create=False
+            )
+            legacy_directory = workspace / "compiled_skills"
+            self._legacy_directories = (
+                [legacy_directory] if legacy_directory != self.directory else []
+            )
+        else:
+            self.directory = workspace / directory_name
+            self._legacy_directories = []
         self._loaded: dict[str, LoadedWorkflow] = {}
         self.refresh()
 
     def refresh(self) -> None:
         loaded: dict[str, LoadedWorkflow] = {}
-        if self.directory.exists():
-            for path in sorted(self.directory.glob("*_workflow.py")):
+        for directory in self._workflow_directories():
+            for path in sorted(directory.glob("*_workflow.py")):
                 workflow = self._load_one(path)
-                if workflow is not None:
+                if workflow is not None and workflow.metadata.name not in loaded:
                     loaded[workflow.metadata.name] = workflow
         self._loaded = loaded
 
@@ -82,6 +94,13 @@ class WorkflowLoader:
             lines.append("</workflow>")
         lines.append("</compiled-workflows>")
         return "\n".join(lines)
+
+    def _workflow_directories(self) -> list[Path]:
+        return [
+            directory
+            for directory in [self.directory, *self._legacy_directories]
+            if directory.exists()
+        ]
 
     def load_runtime_config(self, workflow: LoadedWorkflow) -> dict[str, Any]:
         if workflow.config_path is None or not workflow.config_path.exists():

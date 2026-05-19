@@ -88,6 +88,11 @@ def validate_graph(graph: SkillGraph) -> ValidationResult:
     return result
 
 
+def workflow_blocking_issues(result: ValidationResult) -> list[ValidationIssue]:
+    """Return validation issues that should block executable workflow builds."""
+    return list(result.errors)
+
+
 def _validate_step_execution(step: Step, result: ValidationResult) -> None:
     if step.step_type == StepType.TOOL_CALL:
         if not step.execution_spec or not step.execution_spec.command:

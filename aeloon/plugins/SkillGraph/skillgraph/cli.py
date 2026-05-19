@@ -4,6 +4,8 @@ import argparse
 import os
 from pathlib import Path
 
+from aeloon.core.config.paths import get_storage_gateway
+
 from . import (
     Analyzer,
     SkillPackage,
@@ -15,6 +17,7 @@ from . import (
 from . import (
     compile as compile_skill,
 )
+from .validator import workflow_blocking_issues
 
 
 def _prepare_cache(package, cache_dir: Path) -> tuple[Path, bool, Path]:
@@ -41,6 +44,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("skill", help="Path to SKILL.md or a skill directory")
     parser.add_argument(
+        "--workspace",
+        default="",
+        help="Aeloon workspace used for default project cache exits (default: current directory)",
+    )
+    parser.add_argument(
         "-o", "--output", default="", help="Output Python file path (required for full compile)"
     )
     parser.add_argument("--model", default="openai/gpt-5.4", help="Analyzer model")
@@ -55,9 +63,23 @@ def build_parser() -> argparse.ArgumentParser:
         default=os.getenv("OPENROUTER_API_KEY", ""),
         help="API key (default: OPENROUTER_API_KEY)",
     )
-    parser.add_argument("--cache-dir", default="output/graphs", help="Graph cache directory")
+    parser.add_argument(
+        "--cache-dir",
+        default="",
+        help="Graph cache directory (default: project cache/skillgraph under --workspace)",
+    )
     parser.add_argument(
         "--report-path", default="", help="Optional explicit path for compile report JSON"
+    )
+    parser.add_argument("--task-context-path", default="", help="Optional task context path")
+    parser.add_argument("--verifier-command", default="", help="Optional verifier command")
+    parser.add_argument("--trace-path", default="", help="Optional successful trace path")
+    parser.add_argument("--target-output", action="append", default=[], help="Expected output path")
+    parser.add_argument("--compile-goal", default="", help="guidance, adapter, workflow, or solver")
+    parser.add_argument(
+        "--artifact-policy",
+        default="",
+        help="Evidence policy for artifact promotion: generic, trace, or family",
     )
     parser.add_argument(
         "--analyze-only",
@@ -70,9 +92,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--strict-validate",
         action="store_true",
-        help="Fail compile if SkillGraph validation finds errors (default: loose mode)",
+        help=(
+            "Compatibility flag. Workflow compilation always fails on blocking "
+            "validation issues; validate-only exits nonzero when blockers exist."
+        ),
     )
     return parser
+
+
+def _workspace_root(raw_workspace: str) -> Path:
+    if raw_workspace:
+        return Path(raw_workspace).expanduser()
+    return Path.cwd()
+
+
+def _cache_dir(raw_cache_dir: str, workspace: Path) -> Path:
+    if raw_cache_dir:
+        return Path(raw_cache_dir).expanduser()
+    return get_storage_gateway(workspace).project_cache_root("skillgraph")
 
 
 def main() -> None:
@@ -86,7 +123,8 @@ def main() -> None:
         parser.error("-o/--output is required unless using --analyze-only or --validate-only")
 
     skill_path = Path(args.skill)
-    cache_dir = Path(args.cache_dir)
+    workspace = _workspace_root(args.workspace)
+    cache_dir = _cache_dir(args.cache_dir, workspace)
 
     if args.analyze_only or args.validate_only:
         package = build_skill_package(skill_path)
@@ -109,6 +147,7 @@ def main() -> None:
         if validation.warnings:
             for issue in validation.warnings:
                 print(f"WARN  [{issue.code}] {issue.message} ({issue.step_id or 'graph'})")
+        blocking = workflow_blocking_issues(validation)
 
         report_target = (
             Path(args.report_path)
@@ -119,7 +158,7 @@ def main() -> None:
         report.save(report_target)
         print(report_target)
 
-        if args.strict_validate and validation.errors:
+        if args.strict_validate and blocking:
             raise SystemExit(1)
         return
 
@@ -133,6 +172,12 @@ def main() -> None:
         cache_dir=cache_dir,
         strict_validate=args.strict_validate,
         report_path=Path(args.report_path) if args.report_path else None,
+        task_context_path=Path(args.task_context_path) if args.task_context_path else None,
+        verifier_command=args.verifier_command or None,
+        trace_path=Path(args.trace_path) if args.trace_path else None,
+        target_outputs=list(args.target_output or []),
+        compile_goal=args.compile_goal or None,
+        artifact_policy=args.artifact_policy or None,
     )
     print(output)
 

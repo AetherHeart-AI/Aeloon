@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -39,6 +39,10 @@ class ReferenceSection:
     line: int
     formulas: list[str]
     keywords: list[str]
+    query_aliases: list[str] = field(default_factory=list)
+    use_cases: list[str] = field(default_factory=list)
+    confidence: float = 1.0
+    validation_status: str = "static"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -49,7 +53,98 @@ class ReferenceSection:
             "line": self.line,
             "formulas": list(self.formulas),
             "keywords": list(self.keywords),
+            "query_aliases": list(self.query_aliases),
+            "use_cases": list(self.use_cases),
+            "confidence": self.confidence,
+            "validation_status": self.validation_status,
         }
+
+
+def _apply_refined_reference_payload(
+    sections: list[ReferenceSection],
+    data: dict[str, Any],
+) -> tuple[list[ReferenceSection], list[str], bool]:
+    if not isinstance(data, dict):
+        return sections, ["refinement_payload_not_object"], False
+    items = data.get("sections")
+    if not isinstance(items, list):
+        return sections, ["refinement_missing_sections"], False
+
+    refined: list[ReferenceSection] = []
+    issues: list[str] = []
+    changed = False
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        indexes = item.get("source_indexes")
+        if not isinstance(indexes, list):
+            indexes = [item.get("source_index")]
+        source_sections: list[ReferenceSection] = []
+        for raw_index in indexes:
+            try:
+                source_index = int(raw_index)
+            except (TypeError, ValueError):
+                issues.append(f"ignored_invalid_source_index:{raw_index}")
+                continue
+            if source_index < 1 or source_index > len(sections):
+                issues.append(f"ignored_invalid_source_index:{source_index}")
+                continue
+            source_sections.append(sections[source_index - 1])
+        if not source_sections:
+            continue
+
+        first = source_sections[0]
+        formulas: list[str] = []
+        for section in source_sections:
+            for formula in section.formulas:
+                if formula not in formulas:
+                    formulas.append(formula)
+
+        refined.append(
+            ReferenceSection(
+                title=_bounded_text(item.get("title"), first.title, limit=160),
+                heading_path=list(first.heading_path),
+                summary=_bounded_text(item.get("summary"), first.summary, limit=700),
+                body="\n\n".join(section.body for section in source_sections),
+                line=first.line,
+                formulas=formulas,
+                keywords=_list_strings(item.get("keywords"), limit=120) or list(first.keywords),
+                query_aliases=_list_strings(item.get("query_aliases"), limit=80),
+                use_cases=_list_strings(item.get("use_cases"), limit=80),
+                confidence=_confidence(item.get("confidence"), default=first.confidence),
+                validation_status="llm_refined_validated",
+            )
+        )
+        changed = True
+
+    if not refined:
+        return sections, issues + ["refinement_produced_no_sections"], False
+    return refined, issues, changed
+
+
+def _bounded_text(value: Any, fallback: str, *, limit: int) -> str:
+    text = str(value or "").strip()
+    return text[:limit].rstrip() if text else fallback
+
+
+def _list_strings(value: Any, *, limit: int) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    result: list[str] = []
+    for item in value:
+        text = str(item or "").strip()
+        if text and text not in result:
+            result.append(text[:120].rstrip())
+        if len(result) >= limit:
+            break
+    return result
+
+
+def _confidence(value: Any, *, default: float) -> float:
+    try:
+        return min(1.0, max(0.0, float(value)))
+    except (TypeError, ValueError):
+        return default
 
 
 def generate_reference_adapter(

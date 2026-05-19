@@ -66,23 +66,68 @@ class WorkflowTool(_BaseWorkflowTool):
         required_text = (
             f" Required inputs: {', '.join(required_inputs)}." if required_inputs else ""
         )
+        boundary = _workflow_boundary(workflow)
+        strategy_hint = _workflow_strategy_hint(boundary)
+        planlet_hint = _workflow_planlet_hint(boundary)
         return (
             f"Run the compiled workflow '{self._workflow_name}' when it exactly matches the task."
             f" {workflow.metadata.description or ''}{required_text} "
+            "Pass boundary fields such as `planlet`, `operation`, `arguments`, and `execute` directly, "
+            "or put them under `inputs`. "
+            f"{strategy_hint} {planlet_hint} "
             "If the workflow becomes blocked, repair the issue with normal tools and then call `resume_workflow`."
         )
 
     @property
     def parameters(self) -> dict[str, Any]:
+        workflow = self._loader.get_workflow(self._workflow_name)
+        if workflow is not None:
+            boundary = _workflow_boundary(workflow)
+            tool_schema = boundary.get("tool_schema") if isinstance(boundary, dict) else None
+            if isinstance(tool_schema, dict) and tool_schema.get("type") == "object":
+                return tool_schema
         return {
             "type": "object",
             "properties": {
                 "inputs": {"type": "object"},
+                "request": {
+                    "type": "string",
+                    "description": "Natural-language request for operator selection.",
+                },
+                "task": {
+                    "type": "string",
+                    "description": "Optional task summary for operator selection.",
+                },
+                "planlet": {
+                    "type": "string",
+                    "description": "Optional reusable skill-level planlet to execute when its bindings are available.",
+                },
+                "operation": {
+                    "type": "string",
+                    "description": "Exact compiled boundary operation to run.",
+                },
+                "arguments": {
+                    "type": "object",
+                    "description": "Structured arguments for the selected operation.",
+                },
+                "execute": {
+                    "type": "boolean",
+                    "description": "Set true to execute adapter or operator workflows when inputs are available.",
+                },
+                "allow_network": {
+                    "type": "boolean",
+                    "description": "Explicitly allow network-risk operations.",
+                },
+                "files": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional workspace files relevant to the operation.",
+                },
             },
             "required": [],
         }
 
-    async def execute(self, inputs: dict[str, Any] | None = None, **_: Any) -> str:
+    async def execute(self, inputs: dict[str, Any] | None = None, **kwargs: Any) -> str:
         workflow_name = self._workflow_name
         workflow = self._loader.get_workflow(workflow_name)
         if workflow is None:
@@ -99,6 +144,9 @@ class WorkflowTool(_BaseWorkflowTool):
                 ensure_ascii=False,
             )
 
+        runtime_inputs = dict(inputs) if isinstance(inputs, dict) else {}
+        runtime_inputs.update({key: value for key, value in kwargs.items() if value is not None})
+
         runtime_cfg = self._loader.load_runtime_config(workflow)
         sandbox_dir = str(workflow.sandbox_path) if workflow.sandbox_path else ""
         state = {
@@ -107,7 +155,7 @@ class WorkflowTool(_BaseWorkflowTool):
                 "sandbox_dir": sandbox_dir,
                 "_runtime_config": runtime_cfg,
                 "_llm_callable": make_llm_callable(self._provider, self._model),
-                **(inputs or {}),
+                **runtime_inputs,
             },
             "step_results": {},
             "error": None,
@@ -315,6 +363,84 @@ class WorkflowTool(_BaseWorkflowTool):
             current_step=current_step,
             block=block,
         )
+
+
+def _workflow_boundary(workflow: Any) -> dict[str, Any]:
+    manifest_path = getattr(workflow, "manifest_path", None)
+    if manifest_path is not None and manifest_path.exists():
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8") or "{}")
+        except Exception:
+            manifest = {}
+        metadata = manifest.get("metadata") if isinstance(manifest, dict) else {}
+        boundary = metadata.get("artifact_boundary") if isinstance(metadata, dict) else {}
+        if isinstance(boundary, dict) and boundary:
+            return boundary
+    boundary = getattr(getattr(workflow, "module", None), "ARTIFACT_BOUNDARY", None)
+    return boundary if isinstance(boundary, dict) else {}
+
+
+def _workflow_strategy_hint(boundary: dict[str, Any]) -> str:
+    if not boundary:
+        return ""
+    boundary_kind = str(boundary.get("boundary") or "adapter")
+    selection = boundary.get("selection_policy") if isinstance(boundary, dict) else {}
+    direct_level = str((selection or {}).get("direct_call_level") or "")
+    doc_policy = str((selection or {}).get("doc_read_policy") or "")
+    ops = _boundary_operation_names(boundary)
+    op_text = f" Available operations: {', '.join(ops[:8])}." if ops else ""
+    if boundary_kind == "adapter" and direct_level == "inspect_first":
+        return (
+            "Boundary policy: adapter/inspect_first. Prefer `search_skill_docs` or "
+            "`get_skill_asset` with `arguments`; do not set `execute=true` for workspace "
+            "files unless you intentionally selected an executable operation with all "
+            f"required arguments.{op_text}"
+        )
+    if direct_level in {"operator_first", "solver_first"} or boundary_kind in {
+        "typed_operator",
+        "workflow_solver",
+        "jit_solver",
+    }:
+        return (
+            f"Boundary policy: {boundary_kind}/{direct_level or 'operator_first'}. "
+            "Prefer an exact `operation` plus structured `arguments`; pass workspace "
+            "files through `arguments` and/or `files` instead of relying only on a "
+            f"natural-language request.{op_text}"
+        )
+    if doc_policy == "required":
+        return (
+            f"Boundary policy: {boundary_kind}; read targeted preserved guidance first "
+            f"with `search_skill_docs` or `get_skill_asset` before manual edits.{op_text}"
+        )
+    return f"Boundary policy: {boundary_kind}.{op_text}"
+
+
+def _workflow_planlet_hint(boundary: dict[str, Any]) -> str:
+    planlets = [item for item in boundary.get("planlets") or [] if isinstance(item, dict)]
+    if not planlets:
+        return ""
+    compact = []
+    for planlet in planlets[:4]:
+        bindings = planlet.get("bindings") if isinstance(planlet.get("bindings"), dict) else {}
+        required = ", ".join(str(item) for item in bindings.get("required") or [])
+        required_text = f" requires: {required}" if required else ""
+        compact.append(f"{planlet.get('id')} ({planlet.get('intent')}{required_text})")
+    return (
+        "Reusable planlets available: "
+        + "; ".join(str(item) for item in compact if item)
+        + ". Prefer a matching `planlet` over manually chaining operations when bindings are known."
+    )
+
+
+def _boundary_operation_names(boundary: dict[str, Any]) -> list[str]:
+    names: list[str] = []
+    for op in boundary.get("operators") or []:
+        if not isinstance(op, dict):
+            continue
+        name = str(op.get("name") or op.get("id") or "")
+        if name and name not in names:
+            names.append(name)
+    return names
 
 
 class ResumeWorkflowTool(_BaseWorkflowTool):

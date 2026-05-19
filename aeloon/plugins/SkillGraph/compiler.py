@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from aeloon.core.config.paths import get_storage_gateway
 from aeloon.providers.base import LLMProvider
 
 
@@ -54,10 +55,9 @@ def compile_skill_to_workspace(
     api = _load_skillgraph_api()
     resolved_skill_path = _resolve_skill_path(workspace, request.skill_path)
     package = api.build_skill_package(resolved_skill_path)
-    compiled_dir = workspace / "compiled_skills"
-    compiled_dir.mkdir(parents=True, exist_ok=True)
-    cache_dir = workspace / ".aeloon" / "skillgraph"
-    cache_dir.mkdir(parents=True, exist_ok=True)
+    storage = get_storage_gateway(workspace)
+    compiled_dir = storage.project_compiled_skills_root()
+    cache_dir = storage.project_cache_root("skillgraph")
 
     output_path = compiled_dir / f"{package.slug}_workflow.py"
     report_path = cache_dir / f"{package.slug}.report.json"
@@ -122,9 +122,25 @@ class _SkillgraphApi:
 
 def _resolve_skill_path(workspace: Path, raw_path: str) -> Path:
     candidate = Path(raw_path).expanduser()
-    if not candidate.is_absolute():
-        candidate = workspace / candidate
-    return candidate.resolve()
+    if candidate.is_absolute():
+        return candidate.resolve()
+
+    workspace_candidate = workspace / candidate
+    if workspace_candidate.exists():
+        return workspace_candidate.resolve()
+
+    project_skills_root = get_storage_gateway(workspace).project_skills_root(create=False)
+    parts = candidate.parts
+    if parts and parts[0] == "skills":
+        project_skill_candidate = project_skills_root.joinpath(*parts[1:])
+        if project_skill_candidate.exists():
+            return project_skill_candidate.resolve()
+
+    direct_project_skill_candidate = project_skills_root / candidate
+    if direct_project_skill_candidate.exists():
+        return direct_project_skill_candidate.resolve()
+
+    return workspace_candidate.resolve()
 
 
 def _discover_workflow_name(output_path: Path) -> str:

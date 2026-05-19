@@ -68,6 +68,12 @@ def compile(
     cache_dir: str | Path | None = None,
     strict_validate: bool = False,
     report_path: str | Path | None = None,
+    task_context_path: str | Path | None = None,
+    verifier_command: str | None = None,
+    trace_path: str | Path | None = None,
+    target_outputs: list[str] | None = None,
+    compile_goal: str | None = None,
+    artifact_policy: str | None = None,
 ) -> Path:
     """
     Compile a SKILL.md (or skill directory) into a standalone LangGraph Python file.
@@ -89,6 +95,12 @@ def compile(
         strict_validate: If true, fail compile on SkillGraph validation errors.
             If false (default), only warn and continue code generation.
         report_path: Optional explicit path for compile report JSON.
+        task_context_path: Optional task instructions/tests path for task-aware compilation.
+        verifier_command: Optional command that verifies generated outputs.
+        trace_path: Optional successful trace to solidify into an adapter.
+        target_outputs: Optional output files the compiled artifact should produce.
+        compile_goal: Optional goal hint: guidance, adapter, workflow, or solver.
+        artifact_policy: Optional evidence policy: generic, trace, or family.
 
     Returns:
         Path to the generated .py file
